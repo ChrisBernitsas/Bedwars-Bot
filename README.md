@@ -13,7 +13,9 @@ The project takes inspiration from systems such as AlphaStar, but uses a hierarc
 - Imitation learning, targeted scenario training, and eventual self-play
 - A real-time HUD and replay system for explaining and debugging decisions
 
-Development is currently in the initial client-foundation phase. Autonomous gameplay and machine-learning systems have not yet been implemented.
+Development is currently in the Phase 1 client-foundation stage. Autonomous
+decision-making, gameplay skills, packet observation, world collection, and
+machine-learning systems have not been implemented.
 
 See [`AGENTS.md`](./AGENTS.md) for the complete architecture, constraints, and development roadmap.
 
@@ -70,9 +72,9 @@ With JDK 8 selected:
 ./gradlew --no-daemon clean test build
 ```
 
-The distributable mod is written to `build/libs/bedwarsbot-0.1.0.jar`. There
-are no unit tests yet because Phase 0 contains no Minecraft-independent logic;
-the `test` task is still part of the required build check.
+The distributable mod is written to `build/libs/bedwarsbot-0.2.0.jar`. JUnit is
+used only for deterministic Minecraft-independent state, safety, queue, and
+serialization tests.
 
 ### Development client smoke test
 
@@ -90,6 +92,83 @@ list. Open a local world, enter `/bedwarsbotsmoke`, and verify that chat shows:
 ```
 
 The command is handled locally by Forge and has no gameplay side effects.
+
+Phase 0 has been verified in a real Forge 1.8.9 development client: the mod
+appeared in the Mods list, the smoke command returned the expected message,
+and the client exited cleanly.
+
+## Phase 1 client foundation
+
+The client always starts in `DISABLED`. The available modes are:
+
+- `DISABLED`: clears proposals and releases every bot-owned movement key.
+- `OBSERVE`: logging and HUD only; proposed input cannot execute.
+- `SHADOW`: displays and logs proposed input; proposed input cannot execute.
+- `ASSIST`: permits explicitly requested smoke-test input after safety checks.
+- `AUTONOMOUS`: permits gated input, but no autonomous decision-maker exists.
+
+Active input is additionally locked to an open single-player world with no GUI
+screen open. Entering any unsafe context—GUI open, missing world/player, or a
+non-local-single-player environment—immediately releases bot-owned inputs and
+clears the proposal. Returning to a safe context cannot resume it; another
+explicit input command is required. Multiplayer input is blocked in this phase.
+
+The emergency-disable binding defaults to F10 and can be changed in Minecraft's
+Controls menu under **Bedwars Bot**. It returns to `DISABLED`, clears the
+proposal, and releases all bot-owned movement bindings immediately.
+
+### Local verification commands
+
+These client-local commands exist only to exercise the foundation in a local
+test world:
+
+```text
+/bedwarsbot status
+/bedwarsbot mode <disabled|observe|shadow|assist|autonomous>
+/bedwarsbot input <clear|forward|backward|left|right|jump|sneak|sprint>
+/bedwarsbot input hotbar <1-9>
+```
+
+Each mode transition clears proposed and active input. Movement proposals are
+persistent until cleared, blocked by context, or stopped with F10. No attack,
+use-item, rotation, placement, GUI, or packet action exists.
+
+### Debug HUD and session logs
+
+The HUD displays:
+
+- Current mode and safety-gate status.
+- Proposed and active input frames.
+- Control-loop duration in microseconds.
+- Logger queue depth, capacity, dropped-record count, and writer failure.
+
+Session logs are schema-v1 JSONL files under `run/bedwarsbot/logs/`. Producers
+use nonblocking queue insertion into a fixed 1,024-record queue. If it fills,
+the newest record is dropped and the HUD counter increases. A daemon writer
+performs file I/O, and a shutdown hook drains and closes the log on clean exit.
+
+### Phase 1 real-client checklist
+
+Use a local single-player world only:
+
+1. Launch with `./gradlew --no-daemon runClient` and confirm the HUD starts in
+   `DISABLED` with `proposed=none` and `active=none`.
+2. Run `/bedwarsbot mode shadow`, then `/bedwarsbot input forward`. Confirm the
+   HUD shows the proposal but the player does not move and active input is none.
+3. Run `/bedwarsbot mode assist`; confirm the mode transition clears the prior
+   proposal. Then run `/bedwarsbot input forward` and confirm ordinary forward
+   movement and matching proposed/active HUD values.
+4. While moving, press F10. Confirm movement stops in the same tick, the mode is
+   `DISABLED`, and both HUD input values return to none.
+5. Return to `ASSIST`, run `/bedwarsbot input hotbar 2`, and confirm selection
+   through the normal hotbar binding. Run `/bedwarsbot input clear` afterward.
+6. With forward active, open a GUI. Confirm active and proposed input both
+   become none. Close the GUI and confirm movement does not resume. Submit a new
+   `/bedwarsbot input forward` command and confirm only that new proposal moves.
+7. Exit the client normally. Inspect the newest JSONL file and confirm schema
+   version 1, increasing sequence numbers, mode/input/safety/override events,
+   an `unsafe_context_cleared` event with its reason, a final `session_end`,
+   zero unexpected drops, and no writer failure.
 
 ### Legacy toolchain risks
 
