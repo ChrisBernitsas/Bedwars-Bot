@@ -13,7 +13,7 @@ buildscript {
 
 apply plugin: 'net.minecraftforge.gradle.forge'
 
-version = '0.1.0'
+version = '0.2.0'
 group = 'com.bedwarsbot'
 archivesBaseName = 'bedwarsbot'
 
@@ -28,6 +28,10 @@ minecraft {
     version = '1.8.9-11.15.1.2318-1.8.9'
     runDir = 'run'
     mappings = 'stable_22'
+}
+
+dependencies {
+    testCompile 'junit:junit:4.13.2'
 }
 
 processResources {

@@ -1,10 +1,23 @@
 package com.bedwarsbot;
 
+import java.io.File;
+
+import com.bedwarsbot.command.ClientFoundationCommand;
+import com.bedwarsbot.control.ActionSafetyGate;
+import com.bedwarsbot.control.BotModeStateMachine;
+import com.bedwarsbot.control.ClientFoundation;
+import com.bedwarsbot.control.InputController;
+import com.bedwarsbot.control.ManualOverride;
+import com.bedwarsbot.hud.DebugHud;
+import com.bedwarsbot.logging.AsyncSessionLogger;
+import net.minecraft.client.Minecraft;
 import net.minecraft.command.CommandBase;
 import net.minecraft.command.CommandException;
 import net.minecraft.command.ICommandSender;
 import net.minecraft.util.ChatComponentText;
+import net.minecraftforge.common.MinecraftForge;
 import net.minecraftforge.client.ClientCommandHandler;
+import net.minecraftforge.fml.common.FMLCommonHandler;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.common.event.FMLInitializationEvent;
 
@@ -19,11 +32,39 @@ import net.minecraftforge.fml.common.event.FMLInitializationEvent;
 public final class BedwarsBotMod {
     public static final String MOD_ID = "bedwarsbot";
     public static final String MOD_NAME = "Bedwars Bot";
-    public static final String VERSION = "0.1.0";
+    public static final String VERSION = "0.2.0";
+
+    private AsyncSessionLogger sessionLogger;
 
     @Mod.EventHandler
     public void initialize(FMLInitializationEvent event) {
+        Minecraft minecraft = Minecraft.getMinecraft();
+        sessionLogger = new AsyncSessionLogger(
+            new File(minecraft.mcDataDir, "bedwarsbot/logs").toPath()
+        );
+        ClientFoundation clientFoundation = new ClientFoundation(
+            minecraft,
+            new BotModeStateMachine(),
+            new ActionSafetyGate(),
+            new InputController(minecraft.gameSettings),
+            sessionLogger,
+            VERSION
+        );
+        ManualOverride manualOverride = new ManualOverride(clientFoundation);
+
+        FMLCommonHandler.instance().bus().register(clientFoundation);
+        FMLCommonHandler.instance().bus().register(manualOverride);
+        MinecraftForge.EVENT_BUS.register(new DebugHud(clientFoundation.getHudSnapshotReference()));
+
         ClientCommandHandler.instance.registerCommand(new SmokeTestCommand());
+        ClientCommandHandler.instance.registerCommand(new ClientFoundationCommand(clientFoundation));
+
+        Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
+            @Override
+            public void run() {
+                sessionLogger.close();
+            }
+        }, "bedwarsbot-log-shutdown"));
     }
 
     private static final class SmokeTestCommand extends CommandBase {
