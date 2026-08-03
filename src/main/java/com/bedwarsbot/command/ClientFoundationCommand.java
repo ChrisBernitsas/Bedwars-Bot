@@ -5,6 +5,8 @@ import java.util.Locale;
 import com.bedwarsbot.control.BotMode;
 import com.bedwarsbot.control.ClientFoundation;
 import com.bedwarsbot.control.InputFrame;
+import com.bedwarsbot.verification.ClientVerificationContextCapture;
+import com.bedwarsbot.verification.VerificationEventLogger;
 import net.minecraft.command.CommandBase;
 import net.minecraft.command.CommandException;
 import net.minecraft.command.ICommandSender;
@@ -13,12 +15,22 @@ import net.minecraft.util.EnumChatFormatting;
 
 public final class ClientFoundationCommand extends CommandBase {
     private final ClientFoundation clientFoundation;
+    private final ClientVerificationContextCapture verificationContextCapture;
+    private final VerificationEventLogger verificationLogger;
 
-    public ClientFoundationCommand(ClientFoundation clientFoundation) {
-        if (clientFoundation == null) {
-            throw new IllegalArgumentException("clientFoundation must not be null");
+    public ClientFoundationCommand(
+        ClientFoundation clientFoundation,
+        ClientVerificationContextCapture verificationContextCapture,
+        VerificationEventLogger verificationLogger
+    ) {
+        if (clientFoundation == null
+            || verificationContextCapture == null
+            || verificationLogger == null) {
+            throw new IllegalArgumentException("command dependencies must not be null");
         }
         this.clientFoundation = clientFoundation;
+        this.verificationContextCapture = verificationContextCapture;
+        this.verificationLogger = verificationLogger;
     }
 
     @Override
@@ -28,7 +40,7 @@ public final class ClientFoundationCommand extends CommandBase {
 
     @Override
     public String getCommandUsage(ICommandSender sender) {
-        return "/bedwarsbot <status|mode|input>";
+        return "/bedwarsbot <status|mode|input|marker>";
     }
 
     @Override
@@ -43,6 +55,10 @@ public final class ClientFoundationCommand extends CommandBase {
         }
         if ("input".equalsIgnoreCase(arguments[0])) {
             handleInput(sender, arguments);
+            return;
+        }
+        if ("marker".equalsIgnoreCase(arguments[0])) {
+            handleMarker(sender, arguments);
             return;
         }
         sendError(sender, getCommandUsage(sender));
@@ -128,6 +144,55 @@ public final class ClientFoundationCommand extends CommandBase {
                 + " proposed=" + clientFoundation.getProposedFrame().toCompactString()
                 + " active=" + clientFoundation.getActiveFrame().toCompactString()
         ));
+    }
+
+    private void handleMarker(ICommandSender sender, String[] arguments) {
+        if (arguments.length < 2) {
+            sendError(sender, "/bedwarsbot marker <label>");
+            return;
+        }
+        StringBuilder labelBuilder = new StringBuilder();
+        for (int index = 1; index < arguments.length; index++) {
+            if (labelBuilder.length() > 0) {
+                labelBuilder.append(' ');
+            }
+            labelBuilder.append(arguments[index]);
+        }
+        String label = labelBuilder.toString().trim();
+        if (label.isEmpty() || label.length() > VerificationEventLogger.MAX_LABEL_LENGTH) {
+            sendError(
+                sender,
+                "Marker label must contain 1-" + VerificationEventLogger.MAX_LABEL_LENGTH
+                    + " characters."
+            );
+            return;
+        }
+
+        try {
+            boolean logged = verificationLogger.logMarker(
+                label,
+                clientFoundation.getClientTick(),
+                clientFoundation.getCurrentWorldTick(),
+                clientFoundation.getMode(),
+                clientFoundation.getProposedFrame(),
+                clientFoundation.getActiveFrame(),
+                verificationContextCapture.capture()
+            );
+            if (logged) {
+                sender.addChatMessage(new ChatComponentText(
+                    "[Bedwars Bot] Verification marker logged: " + label
+                ));
+            } else {
+                sendError(sender, "Verification marker could not be queued for logging.");
+            }
+        } catch (RuntimeException markerFailure) {
+            String message = markerFailure.getMessage();
+            sendError(
+                sender,
+                "Verification marker failed: "
+                    + (message == null ? markerFailure.getClass().getSimpleName() : message)
+            );
+        }
     }
 
     private static void sendInputUsage(ICommandSender sender) {

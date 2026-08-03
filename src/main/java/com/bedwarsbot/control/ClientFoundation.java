@@ -133,6 +133,14 @@ public final class ClientFoundation {
         return hudSnapshot;
     }
 
+    public long getClientTick() {
+        return clientTick;
+    }
+
+    public Long getCurrentWorldTick() {
+        return currentWorldTick();
+    }
+
     private ControlContext determineControlContext() {
         if (minecraft.theWorld == null) {
             return ControlContext.WORLD_UNAVAILABLE;

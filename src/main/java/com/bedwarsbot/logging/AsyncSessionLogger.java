@@ -33,6 +33,7 @@ public final class AsyncSessionLogger implements AutoCloseable {
     private final AtomicLong droppedRecords = new AtomicLong();
     private final CountDownLatch stopped = new CountDownLatch(1);
     private final JsonLineEncoder encoder = new JsonLineEncoder();
+    private final Object producerLock = new Object();
     private final Thread writerThread;
 
     private volatile Throwable failure;
@@ -68,14 +69,16 @@ public final class AsyncSessionLogger implements AutoCloseable {
         Long worldTick,
         Map<String, String> details
     ) {
-        inFlightProducers.incrementAndGet();
-        try {
-            if (!accepting.get()) {
-                return false;
+        synchronized (producerLock) {
+            inFlightProducers.incrementAndGet();
+            try {
+                if (!accepting.get()) {
+                    return false;
+                }
+                return offerRecord(createRecord(component, eventType, clientTick, worldTick, details));
+            } finally {
+                inFlightProducers.decrementAndGet();
             }
-            return offerRecord(createRecord(component, eventType, clientTick, worldTick, details));
-        } finally {
-            inFlightProducers.decrementAndGet();
         }
     }
 
@@ -145,15 +148,19 @@ public final class AsyncSessionLogger implements AutoCloseable {
 
     @Override
     public void close() {
-        inFlightProducers.incrementAndGet();
-        try {
-            if (accepting.compareAndSet(true, false)) {
-                Map<String, String> details = new LinkedHashMap<String, String>();
-                details.put("dropped_records", Long.toString(droppedRecords.get()));
-                offerRecord(createRecord("session", "session_end", -1L, null, details));
+        synchronized (producerLock) {
+            inFlightProducers.incrementAndGet();
+            try {
+                if (accepting.compareAndSet(true, false)) {
+                    Map<String, String> details = new LinkedHashMap<String, String>();
+                    details.put("dropped_records", Long.toString(droppedRecords.get()));
+                    String failureMessage = getFailureMessage();
+                    details.put("failure", failureMessage == null ? "" : failureMessage);
+                    offerRecord(createRecord("session", "session_end", -1L, null, details));
+                }
+            } finally {
+                inFlightProducers.decrementAndGet();
             }
-        } finally {
-            inFlightProducers.decrementAndGet();
         }
 
         try {

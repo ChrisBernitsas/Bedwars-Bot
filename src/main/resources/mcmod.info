@@ -2,7 +2,7 @@
   {
     "modid": "bedwarsbot",
     "name": "Bedwars Bot",
-    "description": "Client-only Phase 1 control, safety, HUD, and logging foundation.",
+    "description": "Client-only control foundation with passive block observation prototype.",
     "version": "${version}",
     "mcversion": "${mcversion}",
     "authorList": ["Christopher Bernitsas"],
