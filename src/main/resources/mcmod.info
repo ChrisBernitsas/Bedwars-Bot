@@ -1,0 +1,16 @@
+[
+  {
+    "modid": "bedwarsbot",
+    "name": "Bedwars Bot",
+    "description": "Client-only Phase 0 bootstrap for Minecraft Forge 1.8.9.",
+    "version": "${version}",
+    "mcversion": "${mcversion}",
+    "authorList": ["Christopher Bernitsas"],
+    "credits": "",
+    "url": "",
+    "updateUrl": "",
+    "logoFile": "",
+    "screenshots": [],
+    "dependencies": []
+  }
+]
