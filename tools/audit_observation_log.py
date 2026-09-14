@@ -12,9 +12,12 @@ import sys
 
 OUTER_SCHEMA_VERSION = 1
 OBSERVATION_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SECTION_INDICES = set(range(16))
 DEFAULT_TOP_COUNT = 10
 DEFAULT_MARKER_CONTEXT = 3
 DEFAULT_MARKER_POSITION_WINDOW_SECONDS = 5.0
+DEFAULT_SNAPSHOT_GENERATION_DISPLAY_LIMIT = 12
 
 OBSERVATION_EVENT_TYPES = {
     "block_state_observed",
@@ -23,6 +26,17 @@ OBSERVATION_EVENT_TYPES = {
     "chunk_unloaded_observed",
     "dimension_unloaded_observed",
     "observation_processing_failure",
+}
+
+SNAPSHOT_EVENT_TYPES = {
+    "chunk_snapshot_scheduled",
+    "chunk_snapshot_section_captured",
+    "chunk_snapshot_completed",
+    "chunk_snapshot_aborted",
+    "chunk_snapshot_unloaded",
+    "chunk_snapshot_dimension_unloaded",
+    "chunk_snapshot_scan_tick",
+    "chunk_snapshot_processing_failure",
 }
 
 
@@ -96,6 +110,8 @@ def audit_records(
     event_types = collections.Counter()
     observation_records = []
     overlay_records = []
+    snapshot_records = []
+    snapshot_sequences = []
     block_records_by_sequence = collections.defaultdict(list)
     overlay_records_by_sequence = collections.defaultdict(list)
 
@@ -139,6 +155,8 @@ def audit_records(
         is_observation = component == "observation" and event_type in OBSERVATION_EVENT_TYPES
         is_overlay = component == "block_overlay" and event_type.startswith("overlay_")
         is_pipeline_summary = event_type == "observation_pipeline_summary"
+        is_snapshot = component == "chunk_snapshot" and event_type in SNAPSHOT_EVENT_TYPES
+        is_snapshot_summary = event_type == "chunk_snapshot_pipeline_summary"
         if is_observation or is_overlay or is_pipeline_summary:
             version = _detail_int(details, "observation_schema_version", location, errors)
             if version is not None and version != OBSERVATION_SCHEMA_VERSION:
@@ -147,6 +165,23 @@ def audit_records(
                         location, version, OBSERVATION_SCHEMA_VERSION
                     )
                 )
+
+        if is_snapshot or is_snapshot_summary:
+            version = _detail_int(details, "snapshot_schema_version", location, errors)
+            if version is not None and version != SNAPSHOT_SCHEMA_VERSION:
+                errors.append(
+                    "{} snapshot schema version is {}, expected {}".format(
+                        location, version, SNAPSHOT_SCHEMA_VERSION
+                    )
+                )
+        if is_snapshot:
+            snapshot_records.append((index, record))
+            if event_type != "chunk_snapshot_processing_failure":
+                snapshot_sequence = _detail_int(
+                    details, "snapshot_capture_sequence", location, errors
+                )
+                if snapshot_sequence is not None:
+                    snapshot_sequences.append((snapshot_sequence, location))
 
         if is_observation:
             observation_sequence = _detail_int(
@@ -172,6 +207,7 @@ def audit_records(
     _verify_strict_order("global sequence", global_sequences, errors)
     _verify_strict_order("observation sequence", observation_sequences, errors)
     _verify_strict_order("overlay observation sequence", overlay_sequences, errors)
+    _verify_strict_order("snapshot capture sequence", snapshot_sequences, errors)
 
     session_start_records = [
         record for record in records if record.get("event_type") == "session_start"
@@ -233,6 +269,13 @@ def audit_records(
         marker_position_window_seconds,
         errors,
     )
+    snapshots = _analyze_snapshots(
+        records,
+        snapshot_records,
+        session["duration_seconds"],
+        errors,
+        warnings,
+    )
 
     if not markers:
         warnings.append("session contains no verification_marker events")
@@ -268,6 +311,7 @@ def audit_records(
         "block_types": analytics["top_block_types"],
         "duplicate_observations": analytics["duplicates"],
         "chunks": chunk_report,
+        "snapshots": snapshots,
         "event_rate": rate,
         "markers": markers,
         "event_type_counts": dict(sorted(event_types.items())),
@@ -621,6 +665,682 @@ def _analyze_health(records, session_end_records, observation_records, overlay_r
     }
 
 
+def _analyze_snapshots(records, snapshot_records, duration_seconds, errors, warnings):
+    summaries = [
+        record
+        for record in records
+        if record.get("event_type") == "chunk_snapshot_pipeline_summary"
+    ]
+    empty = {
+        "present": False,
+        "scheduled_generations": [],
+        "generations": [],
+        "duplicate_section_captures": [],
+        "obsolete_generation_events": [],
+        "obsolete_generation_mutations": 0,
+        "final_coverage": {"partial": 0, "complete": 0, "stale": 0},
+        "reconciliation": {},
+        "queue": {
+            "accepted": None,
+            "processed": None,
+            "dropped": None,
+            "failures": None,
+            "final_depth": None,
+            "capacity": None,
+        },
+        "scan": {
+            "ticks": 0,
+            "blocks": 0,
+            "max_elapsed_nanos": 0,
+            "max_reported_nanos": 0,
+            "partial_section_resume_count": 0,
+            "stop_reasons": {},
+        },
+        "rate": {
+            "records": 0,
+            "records_per_second": 0.0,
+            "bytes": 0,
+            "bytes_per_second": 0.0,
+            "estimated_bytes_per_hour": 0.0,
+        },
+    }
+    if not snapshot_records and not summaries:
+        warnings.append("session contains no chunk-snapshot records")
+        return empty
+
+    result = dict(empty)
+    result["present"] = True
+    if len(summaries) != 1:
+        errors.append(
+            "expected exactly one chunk_snapshot_pipeline_summary, found {}".format(
+                len(summaries)
+            )
+        )
+        summary_details = None
+        summary_location = "snapshot summary"
+    else:
+        summary_details = summaries[0].get("details", {})
+        summary_location = _record_location(summaries[0], 0)
+
+    current_generation = {}
+    generations = {}
+    scheduled_generations = []
+    duplicate_sections = []
+    obsolete_events = []
+    obsolete_mutations = 0
+    counts = collections.Counter()
+    scan_stop_reasons = collections.Counter()
+    scan_ticks = []
+    previous_reported_max = 0
+    previous_resume_count = 0
+    mutation_types = {
+        "chunk_snapshot_section_captured",
+        "chunk_snapshot_completed",
+        "chunk_snapshot_aborted",
+        "chunk_snapshot_unloaded",
+    }
+
+    for _, record in snapshot_records:
+        event_type = record.get("event_type")
+        details = record.get("details", {})
+        location = _record_location(record, 0)
+        counts[event_type] += 1
+        if event_type == "chunk_snapshot_processing_failure":
+            errors.append("{} snapshot processing failure event".format(location))
+            continue
+
+        dimension = _detail_int(details, "dimension", location, errors)
+        if event_type == "chunk_snapshot_dimension_unloaded":
+            if dimension is None:
+                continue
+            for chunk, generation in list(current_generation.items()):
+                if chunk[0] != dimension:
+                    continue
+                state = generations[(chunk, generation)]
+                if not state["completed"] and not state["aborted"] and not state["schedule_dropped"]:
+                    errors.append(
+                        "{} dimension unload staled incomplete {} without an abort".format(
+                            location, _snapshot_generation_label(chunk, generation)
+                        )
+                    )
+                state["stale"] = True
+                state["dimension_unloaded"] = True
+            continue
+
+        chunk_x = _detail_int(details, "chunk_x", location, errors)
+        chunk_z = _detail_int(details, "chunk_z", location, errors)
+        generation = _detail_int(details, "load_generation", location, errors)
+        if None in (dimension, chunk_x, chunk_z, generation):
+            continue
+        chunk = (dimension, chunk_x, chunk_z)
+        key = (chunk, generation)
+        capture_outcome = str(details.get("capture_outcome", ""))
+        logged_apply_outcome = str(details.get("apply_outcome", ""))
+        if logged_apply_outcome == "OLD_GENERATION":
+            counts["rejected_old_generations"] += 1
+        elif logged_apply_outcome == "OUT_OF_ORDER":
+            counts["rejected_out_of_order"] += 1
+
+        if event_type == "chunk_snapshot_scheduled":
+            previous = current_generation.get(chunk)
+            if capture_outcome == "DUPLICATE":
+                counts["duplicate_load_callbacks"] += 1
+                if previous != generation or key not in generations:
+                    errors.append(
+                        "{} duplicate load references unknown/current-mismatched generation {}".format(
+                            location, generation
+                        )
+                    )
+                continue
+            if capture_outcome not in {"SCHEDULED", "PENDING_CAPACITY_EXCEEDED"}:
+                errors.append(
+                    "{} unsupported snapshot schedule outcome {!r}".format(
+                        location, capture_outcome
+                    )
+                )
+                continue
+            if previous is not None and generation <= previous:
+                errors.append(
+                    "{} reload generation {} does not progress beyond {} for {}".format(
+                        location, generation, previous, _format_chunk(chunk)
+                    )
+                )
+                continue
+            if key in generations:
+                errors.append(
+                    "{} schedules generation {} more than once".format(location, generation)
+                )
+                continue
+            current_generation[chunk] = generation
+            state = {
+                "chunk": chunk,
+                "generation": generation,
+                "sections": set(),
+                "section_events": 0,
+                "completed": False,
+                "invalid_completion": False,
+                "aborted": False,
+                "stale": False,
+                "unloaded": False,
+                "dimension_unloaded": False,
+                "schedule_dropped": capture_outcome == "PENDING_CAPACITY_EXCEEDED",
+                "partial_recorded": capture_outcome == "PENDING_CAPACITY_EXCEEDED",
+            }
+            generations[key] = state
+            scheduled_generations.append(
+                {
+                    "chunk": _format_chunk(chunk),
+                    "generation": generation,
+                    "outcome": capture_outcome,
+                }
+            )
+            counts["scheduled_loads"] += capture_outcome == "SCHEDULED"
+            counts["dropped_schedules"] += capture_outcome == "PENDING_CAPACITY_EXCEEDED"
+            continue
+
+        current = current_generation.get(chunk)
+        if current != generation:
+            obsolete = current is not None and generation < current
+            event = {
+                "event_type": event_type,
+                "chunk": _format_chunk(chunk),
+                "generation": generation,
+                "current_generation": current,
+                "obsolete": obsolete,
+                "location": location,
+            }
+            obsolete_events.append(event)
+            if event_type in mutation_types:
+                obsolete_mutations += 1
+                errors.append(
+                    "{} obsolete-generation mutation {} generation={} current={}".format(
+                        location, event_type, generation, current
+                    )
+                )
+            elif not obsolete:
+                errors.append(
+                    "{} snapshot event references unscheduled generation {}".format(
+                        location, generation
+                    )
+                )
+            continue
+        state = generations.get(key)
+        if state is None:
+            errors.append(
+                "{} snapshot event references missing scheduled generation {}".format(
+                    location, generation
+                )
+            )
+            continue
+
+        apply_outcome = str(details.get("apply_outcome", ""))
+        if apply_outcome in {"OLD_GENERATION", "OUT_OF_ORDER"}:
+            errors.append(
+                "{} worker rejected snapshot event with apply_outcome={}".format(
+                    location, apply_outcome
+                )
+            )
+
+        if event_type == "chunk_snapshot_section_captured":
+            section_index = _detail_int(details, "section_index", location, errors)
+            captured_sections = _detail_int(
+                details, "captured_sections", location, errors
+            )
+            if section_index is None or captured_sections is None:
+                continue
+            if section_index not in SNAPSHOT_SECTION_INDICES:
+                errors.append(
+                    "{} section_index {} is outside 0-15".format(
+                        location, section_index
+                    )
+                )
+                continue
+            expected_next = len(state["sections"])
+            if section_index in state["sections"]:
+                duplicate = {
+                    "chunk": _format_chunk(chunk),
+                    "generation": generation,
+                    "section_index": section_index,
+                    "location": location,
+                }
+                duplicate_sections.append(duplicate)
+                errors.append(
+                    "{} duplicate section capture {} for {}".format(
+                        location,
+                        section_index,
+                        _snapshot_generation_label(chunk, generation),
+                    )
+                )
+            else:
+                if section_index != expected_next:
+                    errors.append(
+                        "{} section {} is out of capture order; expected {}".format(
+                            location, section_index, expected_next
+                        )
+                    )
+                state["sections"].add(section_index)
+            state["section_events"] += 1
+            if captured_sections != len(state["sections"]):
+                errors.append(
+                    "{} captured_sections={} but replay has {} unique section(s)".format(
+                        location, captured_sections, len(state["sections"])
+                    )
+                )
+
+        elif event_type == "chunk_snapshot_completed":
+            if state["completed"]:
+                errors.append(
+                    "{} duplicate completion for {}".format(
+                        location, _snapshot_generation_label(chunk, generation)
+                    )
+                )
+            missing = sorted(SNAPSHOT_SECTION_INDICES - state["sections"])
+            extra_count = state["section_events"] - len(state["sections"])
+            valid_completion = not missing and extra_count == 0 and len(state["sections"]) == 16
+            if not valid_completion:
+                errors.append(
+                    "{} completion without exactly sections 0-15 for {}: missing={} duplicate_events={}".format(
+                        location,
+                        _snapshot_generation_label(chunk, generation),
+                        missing,
+                        extra_count,
+                    )
+                )
+            captured_sections = _detail_int(
+                details, "captured_sections", location, errors
+            )
+            if captured_sections is not None and captured_sections != 16:
+                errors.append(
+                    "{} completion captured_sections={} instead of 16".format(
+                        location, captured_sections
+                    )
+                )
+            state["completed"] = valid_completion
+            state["invalid_completion"] = not valid_completion
+            state["partial_recorded"] = not valid_completion
+            counts["valid_completions"] += valid_completion
+
+        elif event_type == "chunk_snapshot_aborted":
+            captured_sections = _detail_int(
+                details, "captured_sections", location, errors
+            )
+            if state["completed"]:
+                errors.append(
+                    "{} abort follows completion for {}".format(
+                        location, _snapshot_generation_label(chunk, generation)
+                    )
+                )
+            if state["aborted"]:
+                errors.append(
+                    "{} duplicate abort for {}".format(
+                        location, _snapshot_generation_label(chunk, generation)
+                    )
+                )
+            if captured_sections is not None and captured_sections != len(state["sections"]):
+                errors.append(
+                    "{} abort captured_sections={} but replay has {}".format(
+                        location, captured_sections, len(state["sections"])
+                    )
+                )
+            state["aborted"] = True
+            state["partial_recorded"] = True
+
+        elif event_type == "chunk_snapshot_unloaded":
+            captured_sections = _detail_int(
+                details, "captured_sections", location, errors
+            )
+            if captured_sections is not None and captured_sections != len(state["sections"]):
+                errors.append(
+                    "{} unload captured_sections={} but replay has {}".format(
+                        location, captured_sections, len(state["sections"])
+                    )
+                )
+            if not state["completed"] and not state["aborted"] and not state["schedule_dropped"]:
+                errors.append(
+                    "{} incomplete unload for {} was not preceded by abort".format(
+                        location, _snapshot_generation_label(chunk, generation)
+                    )
+                )
+            state["unloaded"] = True
+            state["stale"] = True
+
+        elif event_type == "chunk_snapshot_scan_tick":
+            blocks = _detail_int(details, "blocks_copied_this_tick", location, errors)
+            elapsed = _detail_int(
+                details, "scan_elapsed_nanos_this_tick", location, errors
+            )
+            reported_max = _detail_int(
+                details, "max_observed_client_scan_nanos", location, errors
+            )
+            resume_count = _detail_int(
+                details, "partial_section_resume_count", location, errors
+            )
+            stop_reason = str(details.get("scan_stop_reason", ""))
+            if stop_reason not in {"NONE", "BLOCK_BUDGET", "TIME_BUDGET"}:
+                errors.append(
+                    "{} invalid scan_stop_reason {!r}".format(location, stop_reason)
+                )
+            if blocks is not None and (blocks < 0 or blocks > 4096):
+                errors.append(
+                    "{} blocks_copied_this_tick={} is outside 0-4096".format(
+                        location, blocks
+                    )
+                )
+            if elapsed is not None and elapsed < 0:
+                errors.append("{} scan elapsed time is negative".format(location))
+            if stop_reason == "BLOCK_BUDGET" and blocks != 4096:
+                errors.append(
+                    "{} block-budget stop copied {} blocks instead of 4096".format(
+                        location, blocks
+                    )
+                )
+            if stop_reason == "TIME_BUDGET" and elapsed is not None and elapsed < 1_500_000:
+                errors.append(
+                    "{} time-budget stop elapsed {}ns before 1500000ns".format(
+                        location, elapsed
+                    )
+                )
+            expected_block_flag = str(stop_reason == "BLOCK_BUDGET").lower()
+            expected_time_flag = str(stop_reason == "TIME_BUDGET").lower()
+            if str(details.get("block_budget_stopped_work", "")).lower() != expected_block_flag:
+                errors.append("{} block-budget stop flag is inconsistent".format(location))
+            if str(details.get("time_budget_stopped_work", "")).lower() != expected_time_flag:
+                errors.append("{} time-budget stop flag is inconsistent".format(location))
+            if reported_max is not None:
+                if reported_max < previous_reported_max or (
+                    elapsed is not None and reported_max < elapsed
+                ):
+                    errors.append(
+                        "{} maximum observed scan time regressed or is below this tick".format(
+                            location
+                        )
+                    )
+                previous_reported_max = reported_max
+            if resume_count is not None:
+                if resume_count < previous_resume_count:
+                    errors.append(
+                        "{} partial-section resume count regressed".format(location)
+                    )
+                previous_resume_count = resume_count
+            scan_stop_reasons[stop_reason] += 1
+            scan_ticks.append(
+                {
+                    "blocks": blocks or 0,
+                    "elapsed_nanos": elapsed or 0,
+                    "reported_max_nanos": reported_max or 0,
+                    "resume_count": resume_count or 0,
+                    "stop_reason": stop_reason,
+                }
+            )
+
+    generation_report = []
+    if counts["chunk_snapshot_section_captured"] and not scan_ticks:
+        errors.append("section captures are present but no chunk_snapshot_scan_tick records exist")
+    if scan_ticks:
+        replay_max_scan = max(tick["elapsed_nanos"] for tick in scan_ticks)
+        if previous_reported_max != replay_max_scan:
+            errors.append(
+                "scan reported maximum {}ns but replay maximum is {}ns".format(
+                    previous_reported_max, replay_max_scan
+                )
+            )
+    final_counts = collections.Counter()
+    covered_sections = 0
+    partial_lifetime = 0
+    for (chunk, generation), state in sorted(
+        generations.items(), key=lambda item: (item[0][0], item[0][1])
+    ):
+        is_current = current_generation.get(chunk) == generation
+        if is_current:
+            covered_sections += len(state["sections"])
+            if state["stale"]:
+                final_status = "STALE"
+            elif state["completed"]:
+                final_status = "COMPLETE"
+            else:
+                final_status = "PARTIAL"
+                if (
+                    not state["aborted"]
+                    and not state["schedule_dropped"]
+                    and not state["invalid_completion"]
+                ):
+                    errors.append(
+                        "scheduled generation has no completion or abort: {}".format(
+                            _snapshot_generation_label(chunk, generation)
+                        )
+                    )
+            final_counts[final_status.lower()] += 1
+        else:
+            final_status = "SUPERSEDED"
+        partial_lifetime += bool(state["partial_recorded"])
+        generation_report.append(
+            {
+                "chunk": _format_chunk(chunk),
+                "generation": generation,
+                "section_indices": sorted(state["sections"]),
+                "section_capture_events": state["section_events"],
+                "completed": state["completed"],
+                "invalid_completion": state["invalid_completion"],
+                "aborted": state["aborted"],
+                "unloaded": state["unloaded"],
+                "dimension_unloaded": state["dimension_unloaded"],
+                "final_status": final_status,
+            }
+        )
+
+    queue = empty["queue"].copy()
+    reconciliation = {
+        "scheduled": counts["scheduled_loads"],
+        "completed": counts["valid_completions"],
+        "completion_records": counts["chunk_snapshot_completed"],
+        "aborted": counts["chunk_snapshot_aborted"],
+        "schedule_dropped": counts["dropped_schedules"],
+        "duplicate_load_callbacks": counts["duplicate_load_callbacks"],
+        "section_captures": counts["chunk_snapshot_section_captured"],
+    }
+    if summary_details is not None:
+        numeric_summary = {}
+        for name in (
+            "pending_chunks",
+            "pending_sections",
+            "scheduled_loads",
+            "duplicate_loads",
+            "dropped_schedules",
+            "scanned_blocks",
+            "scanned_sections",
+            "last_scan_nanos",
+            "average_scan_nanos",
+            "max_scan_nanos",
+            "blocks_copied_this_tick",
+            "block_budget_stop_count",
+            "time_budget_stop_count",
+            "partial_section_resume_count",
+            "completed_snapshots",
+            "aborted_snapshots",
+            "partial_snapshots",
+            "complete_chunks",
+            "partial_chunks",
+            "stale_chunks",
+            "covered_sections",
+            "rejected_old_generations",
+            "rejected_out_of_order",
+            "accepted_events",
+            "processed_events",
+            "dropped_events",
+            "failure_count",
+            "queue_depth",
+            "queue_capacity",
+        ):
+            numeric_summary[name] = _detail_int(
+                summary_details, name, summary_location, errors
+            )
+        queue = {
+            "accepted": numeric_summary["accepted_events"],
+            "processed": numeric_summary["processed_events"],
+            "dropped": numeric_summary["dropped_events"],
+            "failures": numeric_summary["failure_count"],
+            "final_depth": numeric_summary["queue_depth"],
+            "capacity": numeric_summary["queue_capacity"],
+        }
+        if queue["dropped"]:
+            errors.append(
+                "snapshot queue reported {} dropped event(s)".format(queue["dropped"])
+            )
+        if queue["failures"]:
+            errors.append(
+                "snapshot pipeline reported {} failure(s)".format(queue["failures"])
+            )
+        if queue["final_depth"] not in (None, 0):
+            errors.append(
+                "snapshot pipeline closed with queue_depth={}".format(
+                    queue["final_depth"]
+                )
+            )
+        if queue["accepted"] is not None and queue["processed"] is not None:
+            if queue["accepted"] != queue["processed"]:
+                errors.append(
+                    "snapshot accepted_events={} but processed_events={}".format(
+                        queue["accepted"], queue["processed"]
+                    )
+                )
+            if queue["processed"] < len(snapshot_records):
+                errors.append(
+                    "snapshot summary processed_events={} but log has {} snapshot event record(s)".format(
+                        queue["processed"], len(snapshot_records)
+                    )
+                )
+        if numeric_summary["dropped_schedules"]:
+            errors.append(
+                "snapshot scheduler reported {} dropped schedule(s)".format(
+                    numeric_summary["dropped_schedules"]
+                )
+            )
+
+        expected_summary = {
+            "pending_chunks": 0,
+            "pending_sections": 0,
+            "scheduled_loads": counts["scheduled_loads"],
+            "duplicate_loads": counts["duplicate_load_callbacks"],
+            "dropped_schedules": counts["dropped_schedules"],
+            "scanned_sections": counts["chunk_snapshot_section_captured"],
+            "scanned_blocks": counts["chunk_snapshot_section_captured"] * 4096,
+            "completed_snapshots": counts["valid_completions"],
+            "aborted_snapshots": counts["chunk_snapshot_aborted"],
+            "partial_snapshots": partial_lifetime,
+            "complete_chunks": final_counts["complete"],
+            "partial_chunks": final_counts["partial"],
+            "stale_chunks": final_counts["stale"],
+            "covered_sections": covered_sections,
+            "rejected_old_generations": counts["rejected_old_generations"],
+            "rejected_out_of_order": counts["rejected_out_of_order"],
+            "block_budget_stop_count": scan_stop_reasons["BLOCK_BUDGET"],
+            "time_budget_stop_count": scan_stop_reasons["TIME_BUDGET"],
+            "partial_section_resume_count": previous_resume_count,
+            "max_scan_nanos": previous_reported_max,
+        }
+        if scan_ticks:
+            expected_summary["average_scan_nanos"] = (
+                sum(tick["elapsed_nanos"] for tick in scan_ticks) // len(scan_ticks)
+            )
+            summary_stop_reason = str(summary_details.get("scan_stop_reason", ""))
+            last_matches = (
+                numeric_summary["blocks_copied_this_tick"] == scan_ticks[-1]["blocks"]
+                and numeric_summary["last_scan_nanos"] == scan_ticks[-1]["elapsed_nanos"]
+                and summary_stop_reason == scan_ticks[-1]["stop_reason"]
+            )
+            idle_matches = (
+                numeric_summary["blocks_copied_this_tick"] == 0
+                and numeric_summary["last_scan_nanos"] == 0
+                and summary_stop_reason == "NONE"
+            )
+            if not last_matches and not idle_matches:
+                errors.append(
+                    "snapshot pipeline summary mismatch for last scan tick/idle state"
+                )
+        else:
+            expected_summary.update(
+                {
+                    "blocks_copied_this_tick": 0,
+                    "last_scan_nanos": 0,
+                    "max_scan_nanos": 0,
+                    "average_scan_nanos": 0,
+                }
+            )
+            if str(summary_details.get("scan_stop_reason", "")) != "NONE":
+                errors.append(
+                    "snapshot summary scan_stop_reason must be NONE without scan ticks"
+                )
+        mismatches = []
+        for name, expected in expected_summary.items():
+            actual = numeric_summary.get(name)
+            if actual is not None and actual != expected:
+                mismatches.append(
+                    {"field": name, "expected": expected, "actual": actual}
+                )
+                errors.append(
+                    "snapshot pipeline summary mismatch {}: expected {}, got {}".format(
+                        name, expected, actual
+                    )
+                )
+        reconciliation["summary_mismatches"] = mismatches
+
+    rate_records = [record for _, record in snapshot_records] + summaries
+    serialized_bytes = 0
+    for record in rate_records:
+        serializable = {
+            key: value for key, value in record.items() if key != "_audit_line_number"
+        }
+        serialized_bytes += len(
+            (json.dumps(serializable, separators=(",", ":")) + "\n").encode("utf-8")
+        )
+    snapshot_record_count = len(rate_records)
+    records_per_second = (
+        snapshot_record_count / duration_seconds if duration_seconds > 0.0 else 0.0
+    )
+    bytes_per_second = (
+        serialized_bytes / duration_seconds if duration_seconds > 0.0 else 0.0
+    )
+
+    result.update(
+        {
+            "scheduled_generations": scheduled_generations,
+            "generations": generation_report,
+            "duplicate_section_captures": duplicate_sections,
+            "obsolete_generation_events": obsolete_events,
+            "obsolete_generation_mutations": obsolete_mutations,
+            "final_coverage": {
+                "partial": final_counts["partial"],
+                "complete": final_counts["complete"],
+                "stale": final_counts["stale"],
+            },
+            "reconciliation": reconciliation,
+            "queue": queue,
+            "scan": {
+                "ticks": len(scan_ticks),
+                "blocks": sum(tick["blocks"] for tick in scan_ticks),
+                "max_elapsed_nanos": max(
+                    (tick["elapsed_nanos"] for tick in scan_ticks), default=0
+                ),
+                "max_reported_nanos": previous_reported_max,
+                "partial_section_resume_count": previous_resume_count,
+                "stop_reasons": dict(sorted(scan_stop_reasons.items())),
+            },
+            "rate": {
+                "records": snapshot_record_count,
+                "records_per_second": records_per_second,
+                "bytes": serialized_bytes,
+                "bytes_per_second": bytes_per_second,
+                "estimated_bytes_per_hour": bytes_per_second * 3600.0,
+            },
+        }
+    )
+    return result
+
+
+def _snapshot_generation_label(chunk, generation):
+    return "{} generation={}".format(_format_chunk(chunk), generation)
+
+
 def _analyze_session(records, monotonic_values, file_bytes, errors):
     if not monotonic_values:
         duration = 0.0
@@ -844,12 +1564,13 @@ def _target_position_history(
     return history
 
 
-def format_text_report(report):
+def format_text_report(report, verbose_snapshots=False):
     session = report["session"]
     overlay = report["overlay"]
     health = report["health"]
     observation_health = health["observation"]
     chunks = report["chunks"]
+    snapshots = report["snapshots"]
     rate = report["event_rate"]
     lines = [
         "Bedwars Bot observation log audit",
@@ -894,9 +1615,139 @@ def format_text_report(report):
             _display_none(observation_health["queue_depth"]),
             _display_none(observation_health["queue_capacity"]),
         ),
-        "",
-        "Most frequently updated positions",
     ]
+    if snapshots["present"]:
+        snapshot_queue = snapshots["queue"]
+        snapshot_rate = snapshots["rate"]
+        snapshot_scan = snapshots["scan"]
+        final_coverage = snapshots["final_coverage"]
+        reconciliation = snapshots["reconciliation"]
+        lines.extend(
+            [
+                "  snapshot accepted={} processed={} dropped={} failures={} queue={}/{}".format(
+                    _display_none(snapshot_queue["accepted"]),
+                    _display_none(snapshot_queue["processed"]),
+                    _display_none(snapshot_queue["dropped"]),
+                    _display_none(snapshot_queue["failures"]),
+                    _display_none(snapshot_queue["final_depth"]),
+                    _display_none(snapshot_queue["capacity"]),
+                ),
+                "",
+                "Chunk snapshot validation",
+                "  scheduled={} completed={} aborted={} schedule-dropped={} duplicate-loads={}".format(
+                    reconciliation.get("scheduled", 0),
+                    reconciliation.get("completed", 0),
+                    reconciliation.get("aborted", 0),
+                    reconciliation.get("schedule_dropped", 0),
+                    reconciliation.get("duplicate_load_callbacks", 0),
+                ),
+                "  final coverage: partial={} complete={} stale={}".format(
+                    final_coverage["partial"],
+                    final_coverage["complete"],
+                    final_coverage["stale"],
+                ),
+                "  obsolete-generation events={} mutations={}".format(
+                    len(snapshots["obsolete_generation_events"]),
+                    snapshots["obsolete_generation_mutations"],
+                ),
+                "  scan ticks={} blocks={} max={}ns reported-max={}ns resumes={}".format(
+                    snapshot_scan["ticks"],
+                    snapshot_scan["blocks"],
+                    snapshot_scan["max_elapsed_nanos"],
+                    snapshot_scan["max_reported_nanos"],
+                    snapshot_scan["partial_section_resume_count"],
+                ),
+                "  scan budget stops: {}".format(
+                    ", ".join(
+                        "{}={}".format(reason, count)
+                        for reason, count in sorted(snapshot_scan["stop_reasons"].items())
+                    ) or "none"
+                ),
+                "  snapshot records={} records/s={:.3f} bytes/s={:.3f} estimated bytes/hour={:.0f}".format(
+                    snapshot_rate["records"],
+                    snapshot_rate["records_per_second"],
+                    snapshot_rate["bytes_per_second"],
+                    snapshot_rate["estimated_bytes_per_hour"],
+                ),
+            ]
+        )
+        scheduled_generations = snapshots["scheduled_generations"]
+        shown_schedules = _snapshot_display_items(
+            scheduled_generations,
+            verbose_snapshots,
+            lambda item: item["outcome"] not in {"SCHEDULED", "DUPLICATE"},
+        )
+        lines.append(_snapshot_display_heading(
+            "scheduled generations",
+            len(shown_schedules),
+            len(scheduled_generations),
+            verbose_snapshots,
+        ))
+        if scheduled_generations:
+            for scheduled in shown_schedules:
+                lines.append(
+                    "    {} generation={} outcome={}".format(
+                        scheduled["chunk"],
+                        scheduled["generation"],
+                        scheduled["outcome"],
+                    )
+                )
+        else:
+            lines.append("    none")
+        generations = snapshots["generations"]
+        shown_generations = _snapshot_display_items(
+            generations,
+            verbose_snapshots,
+            lambda item: item["invalid_completion"]
+            or item["final_status"] == "PARTIAL",
+        )
+        lines.append(_snapshot_display_heading(
+            "section captures by generation",
+            len(shown_generations),
+            len(generations),
+            verbose_snapshots,
+        ))
+        if generations:
+            for generation in shown_generations:
+                lines.append(
+                    "    {} generation={} sections={} events={} complete={} abort={} unload={} dimension-unload={} final={}".format(
+                        generation["chunk"],
+                        generation["generation"],
+                        generation["section_indices"],
+                        generation["section_capture_events"],
+                        str(generation["completed"]).lower(),
+                        str(generation["aborted"]).lower(),
+                        str(generation["unloaded"]).lower(),
+                        str(generation["dimension_unloaded"]).lower(),
+                        generation["final_status"],
+                    )
+                )
+        else:
+            lines.append("    none")
+        if snapshots["duplicate_section_captures"]:
+            lines.append("  duplicate section captures:")
+            for duplicate in snapshots["duplicate_section_captures"]:
+                lines.append(
+                    "    {} generation={} section={} at {}".format(
+                        duplicate["chunk"],
+                        duplicate["generation"],
+                        duplicate["section_index"],
+                        duplicate["location"],
+                    )
+                )
+        if snapshots["obsolete_generation_events"]:
+            lines.append("  obsolete/unscheduled generation events:")
+            for event in snapshots["obsolete_generation_events"]:
+                lines.append(
+                    "    {} {} generation={} current={}".format(
+                        event["location"],
+                        event["event_type"],
+                        event["generation"],
+                        event["current_generation"],
+                    )
+                )
+
+    lines.extend(["", "Most frequently updated positions"])
     lines.extend(_format_ranked(report["positions"], "position", "observations"))
     lines.extend(["", "Most frequently observed block types"])
     lines.extend(_format_ranked(report["block_types"], "block", "observations"))
@@ -1228,6 +2079,31 @@ def _format_rate_series(series):
     return text or "no buckets"
 
 
+def _snapshot_display_items(items, verbose, is_problematic):
+    if verbose or len(items) <= DEFAULT_SNAPSHOT_GENERATION_DISPLAY_LIMIT:
+        return items
+    limit = DEFAULT_SNAPSHOT_GENERATION_DISPLAY_LIMIT
+    selected = {0, len(items) // 2, len(items) - 1}
+    for index, item in enumerate(items):
+        if is_problematic(item):
+            selected.add(index)
+            if len(selected) >= limit:
+                break
+    if len(selected) < limit:
+        for index in range(len(items)):
+            selected.add(index)
+            if len(selected) >= limit:
+                break
+    return [items[index] for index in sorted(selected)[:limit]]
+
+
+def _snapshot_display_heading(label, shown, total, verbose):
+    suffix = ""
+    if not verbose and shown < total:
+        suffix = " (use --verbose-snapshots for all)"
+    return "  {}: showing {} of {}{}".format(label, shown, total, suffix)
+
+
 def _display_none(value):
     return "unknown" if value is None else str(value)
 
@@ -1282,6 +2158,11 @@ def build_argument_parser():
         metavar="SECONDS",
         help="time before/after a marker used for targeted-position history",
     )
+    parser.add_argument(
+        "--verbose-snapshots",
+        action="store_true",
+        help="show every scheduled generation and per-generation section record",
+    )
     return parser
 
 
@@ -1295,7 +2176,10 @@ def main(arguments=None):
             marker_context=options.marker_context,
             marker_position_window_seconds=options.marker_position_window,
         )
-        sys.stdout.write(format_text_report(report))
+        sys.stdout.write(format_text_report(
+            report,
+            verbose_snapshots=options.verbose_snapshots,
+        ))
         if options.json_report:
             write_json_report(options.json_report, report)
     except AuditInputError as error:

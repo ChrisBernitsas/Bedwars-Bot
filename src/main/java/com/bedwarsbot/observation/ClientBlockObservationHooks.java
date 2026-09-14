@@ -1,7 +1,5 @@
 package com.bedwarsbot.observation;
 
-import java.util.concurrent.atomic.AtomicLong;
-
 import net.minecraft.block.Block;
 import net.minecraft.block.state.IBlockState;
 import net.minecraft.client.Minecraft;
@@ -19,18 +17,29 @@ import net.minecraftforge.fml.common.gameevent.TickEvent;
 public final class ClientBlockObservationHooks {
     private final Minecraft minecraft;
     private final ObservationPipeline pipeline;
-    private final AtomicLong nextSequence = new AtomicLong();
+    private final ClientChunkSnapshotCollector chunkSnapshotCollector;
+    private final ObservationSequence sequence;
 
     private WorldClient attachedWorld;
     private WorldAccessObserver attachedObserver;
     private long clientTick;
 
-    public ClientBlockObservationHooks(Minecraft minecraft, ObservationPipeline pipeline) {
-        if (minecraft == null || pipeline == null) {
+    public ClientBlockObservationHooks(
+        Minecraft minecraft,
+        ObservationPipeline pipeline,
+        ClientChunkSnapshotCollector chunkSnapshotCollector,
+        ObservationSequence sequence
+    ) {
+        if (minecraft == null
+            || pipeline == null
+            || chunkSnapshotCollector == null
+            || sequence == null) {
             throw new IllegalArgumentException("observation hook dependencies must not be null");
         }
         this.minecraft = minecraft;
         this.pipeline = pipeline;
+        this.chunkSnapshotCollector = chunkSnapshotCollector;
+        this.sequence = sequence;
     }
 
     @SubscribeEvent
@@ -48,8 +57,9 @@ public final class ClientBlockObservationHooks {
                     attachWorld(currentWorld);
                 }
             }
+            chunkSnapshotCollector.onClientTick(currentWorld, clientTick);
         } catch (RuntimeException failure) {
-            pipeline.recordCaptureFailure(failure);
+            recordCaptureFailure(failure);
         }
     }
 
@@ -61,7 +71,7 @@ public final class ClientBlockObservationHooks {
         try {
             attachWorld((WorldClient) event.world);
         } catch (RuntimeException failure) {
-            pipeline.recordCaptureFailure(failure);
+            recordCaptureFailure(failure);
         }
     }
 
@@ -74,7 +84,7 @@ public final class ClientBlockObservationHooks {
             captureDimensionUnloaded(attachedWorld);
             detachAttachedWorld(false);
         } catch (RuntimeException failure) {
-            pipeline.recordCaptureFailure(failure);
+            recordCaptureFailure(failure);
             attachedWorld = null;
             attachedObserver = null;
         }
@@ -88,8 +98,9 @@ public final class ClientBlockObservationHooks {
         try {
             WorldClient world = (WorldClient) event.world;
             attachWorld(world);
+            long captureSequence = sequence.next();
             pipeline.tryCapture(ObservationEvent.chunkLoaded(
-                nextSequence.getAndIncrement(),
+                captureSequence,
                 clientTick,
                 world.getTotalWorldTime(),
                 System.nanoTime(),
@@ -97,8 +108,9 @@ public final class ClientBlockObservationHooks {
                 event.getChunk().xPosition,
                 event.getChunk().zPosition
             ));
+            chunkSnapshotCollector.onChunkLoaded(world, event.getChunk(), clientTick);
         } catch (RuntimeException failure) {
-            pipeline.recordCaptureFailure(failure);
+            recordCaptureFailure(failure);
         }
     }
 
@@ -109,8 +121,9 @@ public final class ClientBlockObservationHooks {
         }
         try {
             WorldClient world = (WorldClient) event.world;
+            long captureSequence = sequence.next();
             pipeline.tryCapture(ObservationEvent.chunkUnloaded(
-                nextSequence.getAndIncrement(),
+                captureSequence,
                 clientTick,
                 world.getTotalWorldTime(),
                 System.nanoTime(),
@@ -118,8 +131,14 @@ public final class ClientBlockObservationHooks {
                 event.getChunk().xPosition,
                 event.getChunk().zPosition
             ));
+            chunkSnapshotCollector.onChunkUnloaded(
+                world,
+                event.getChunk().xPosition,
+                event.getChunk().zPosition,
+                clientTick
+            );
         } catch (RuntimeException failure) {
-            pipeline.recordCaptureFailure(failure);
+            recordCaptureFailure(failure);
         }
     }
 
@@ -151,13 +170,15 @@ public final class ClientBlockObservationHooks {
     }
 
     private void captureDimensionUnloaded(WorldClient world) {
+        long captureSequence = sequence.next();
         pipeline.tryCapture(ObservationEvent.dimensionUnloaded(
-            nextSequence.getAndIncrement(),
+            captureSequence,
             clientTick,
             world.getTotalWorldTime(),
             System.nanoTime(),
             dimension(world)
         ));
+        chunkSnapshotCollector.onDimensionUnloaded(world, clientTick);
     }
 
     private void captureBlockState(WorldClient world, BlockPos minecraftPosition) {
@@ -168,12 +189,12 @@ public final class ClientBlockObservationHooks {
                 minecraftPosition.getY(),
                 minecraftPosition.getZ()
             );
-            long sequence = nextSequence.getAndIncrement();
+            long captureSequence = sequence.next();
             long capturedNanos = System.nanoTime();
             long worldTick = world.getTotalWorldTime();
             if (!world.isBlockLoaded(minecraftPosition)) {
                 pipeline.tryCapture(ObservationEvent.blockUnavailable(
-                    sequence,
+                    captureSequence,
                     clientTick,
                     worldTick,
                     capturedNanos,
@@ -191,16 +212,30 @@ public final class ClientBlockObservationHooks {
                 block.getMetaFromState(minecraftState)
             );
             pipeline.tryCapture(ObservationEvent.blockState(
-                sequence,
+                captureSequence,
                 clientTick,
                 worldTick,
                 capturedNanos,
                 position,
                 state
             ));
+            int globalStateId = Block.BLOCK_STATE_IDS.get(minecraftState);
+            chunkSnapshotCollector.onBlockStateObserved(
+                position,
+                globalStateId,
+                captureSequence,
+                clientTick,
+                Long.valueOf(worldTick),
+                capturedNanos
+            );
         } catch (RuntimeException failure) {
-            pipeline.recordCaptureFailure(failure);
+            recordCaptureFailure(failure);
         }
+    }
+
+    private void recordCaptureFailure(RuntimeException failure) {
+        pipeline.recordCaptureFailure(failure);
+        chunkSnapshotCollector.recordCaptureFailure(failure);
     }
 
     private static boolean isClientWorld(World world) {

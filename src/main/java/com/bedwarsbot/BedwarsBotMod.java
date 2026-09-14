@@ -10,7 +10,10 @@ import com.bedwarsbot.control.InputController;
 import com.bedwarsbot.control.ManualOverride;
 import com.bedwarsbot.hud.DebugHud;
 import com.bedwarsbot.logging.AsyncSessionLogger;
+import com.bedwarsbot.observation.ChunkSnapshotPipeline;
 import com.bedwarsbot.observation.ClientBlockObservationHooks;
+import com.bedwarsbot.observation.ClientChunkSnapshotCollector;
+import com.bedwarsbot.observation.ObservationSequence;
 import com.bedwarsbot.observation.ObservationPipeline;
 import com.bedwarsbot.verification.VerificationEventLogger;
 import com.bedwarsbot.verification.ClientVerificationContextCapture;
@@ -36,10 +39,12 @@ import net.minecraftforge.fml.common.event.FMLInitializationEvent;
 public final class BedwarsBotMod {
     public static final String MOD_ID = "bedwarsbot";
     public static final String MOD_NAME = "Bedwars Bot";
-    public static final String VERSION = "0.3.0";
+    public static final String VERSION = "0.4.0";
 
     private AsyncSessionLogger sessionLogger;
     private ObservationPipeline observationPipeline;
+    private ChunkSnapshotPipeline chunkSnapshotPipeline;
+    private ClientChunkSnapshotCollector chunkSnapshotCollector;
 
     @Mod.EventHandler
     public void initialize(FMLInitializationEvent event) {
@@ -48,6 +53,13 @@ public final class BedwarsBotMod {
             new File(minecraft.mcDataDir, "bedwarsbot/logs").toPath()
         );
         observationPipeline = new ObservationPipeline(sessionLogger);
+        chunkSnapshotPipeline = new ChunkSnapshotPipeline(sessionLogger);
+        ObservationSequence observationSequence = new ObservationSequence();
+        chunkSnapshotCollector = new ClientChunkSnapshotCollector(
+            minecraft,
+            chunkSnapshotPipeline,
+            observationSequence
+        );
         final VerificationEventLogger verificationLogger = new VerificationEventLogger(
             sessionLogger
         );
@@ -55,7 +67,9 @@ public final class BedwarsBotMod {
             new ClientVerificationContextCapture(minecraft);
         ClientBlockObservationHooks observationHooks = new ClientBlockObservationHooks(
             minecraft,
-            observationPipeline
+            observationPipeline,
+            chunkSnapshotCollector,
+            observationSequence
         );
         ClientFoundation clientFoundation = new ClientFoundation(
             minecraft,
@@ -73,7 +87,8 @@ public final class BedwarsBotMod {
         MinecraftForge.EVENT_BUS.register(observationHooks);
         MinecraftForge.EVENT_BUS.register(new DebugHud(
             clientFoundation.getHudSnapshotReference(),
-            observationPipeline.getHudSnapshotReference()
+            observationPipeline.getHudSnapshotReference(),
+            chunkSnapshotCollector.getHudSnapshotReference()
         ));
 
         ClientCommandHandler.instance.registerCommand(new SmokeTestCommand());
@@ -87,9 +102,17 @@ public final class BedwarsBotMod {
             @Override
             public void run() {
                 try {
-                    observationPipeline.close();
+                    chunkSnapshotCollector.close();
+                    try {
+                        chunkSnapshotPipeline.close();
+                    } finally {
+                        observationPipeline.close();
+                    }
                     verificationLogger.logObservationPipelineSummary(
                         observationPipeline.getHudSnapshotReference().get()
+                    );
+                    chunkSnapshotPipeline.logSummary(
+                        chunkSnapshotCollector.refreshHudSnapshot()
                     );
                 } finally {
                     sessionLogger.close();

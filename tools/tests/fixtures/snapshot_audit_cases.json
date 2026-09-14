@@ -1,0 +1,121 @@
+{
+  "successful_completion": {
+    "generations": [
+      {
+        "generation": 1,
+        "sections": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "complete": true
+      }
+    ],
+    "expected_status": "PASS"
+  },
+  "partial_abort": {
+    "generations": [
+      {
+        "generation": 1,
+        "sections": [0, 1],
+        "abort": true
+      }
+    ],
+    "expected_status": "PASS"
+  },
+  "reload_generation": {
+    "generations": [
+      {
+        "generation": 1,
+        "sections": [0],
+        "abort": true,
+        "unload": true
+      },
+      {
+        "generation": 2,
+        "sections": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "complete": true
+      }
+    ],
+    "expected_status": "PASS"
+  },
+  "stale_complete": {
+    "generations": [
+      {
+        "generation": 1,
+        "sections": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "complete": true,
+        "unload": true
+      }
+    ],
+    "expected_status": "PASS"
+  },
+  "invalid_completion": {
+    "generations": [
+      {
+        "generation": 1,
+        "sections": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+        "complete": true
+      }
+    ],
+    "expected_status": "FAIL",
+    "expected_error": "completion without exactly sections 0-15"
+  },
+  "duplicate_sections": {
+    "generations": [
+      {
+        "generation": 1,
+        "sections": [0, 0],
+        "abort": true
+      }
+    ],
+    "expected_status": "FAIL",
+    "expected_error": "duplicate section capture"
+  },
+  "queue_drop": {
+    "generations": [
+      {
+        "generation": 1,
+        "sections": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "complete": true
+      }
+    ],
+    "summary_overrides": {
+      "dropped_events": "1"
+    },
+    "expected_status": "FAIL",
+    "expected_error": "snapshot queue reported 1 dropped event"
+  },
+  "summary_mismatch": {
+    "generations": [
+      {
+        "generation": 1,
+        "sections": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "complete": true
+      }
+    ],
+    "summary_overrides": {
+      "covered_sections": "15"
+    },
+    "expected_status": "FAIL",
+    "expected_error": "snapshot pipeline summary mismatch covered_sections"
+  },
+  "obsolete_generation_mutation": {
+    "generations": [
+      {
+        "generation": 1,
+        "sections": [0],
+        "abort": true,
+        "unload": true
+      },
+      {
+        "generation": 2,
+        "sections": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "complete": true
+      }
+    ],
+    "obsolete_section": {
+      "generation": 1,
+      "section": 1,
+      "captured_sections": 2
+    },
+    "expected_status": "FAIL",
+    "expected_error": "obsolete-generation mutation"
+  }
+}
