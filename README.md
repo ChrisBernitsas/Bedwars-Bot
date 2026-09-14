@@ -13,9 +13,10 @@ The project takes inspiration from systems such as AlphaStar, but uses a hierarc
 - Imitation learning, targeted scenario training, and eventual self-play
 - A real-time HUD and replay system for explaining and debugging decisions
 
-Development currently includes the Phase 1 client foundation and the Section
-22 Step 3 passive block-event prototype. Autonomous decision-making, gameplay
-skills, packet hooks, navigation, and machine-learning systems have not been
+Development currently includes the Phase 1 client foundation, the Section 22
+Step 3 passive block-event prototype, and bounded passive initial snapshots of
+naturally loaded client chunks. Autonomous decision-making, gameplay skills,
+packet hooks, navigation, and machine-learning systems have not been
 implemented.
 
 See [`AGENTS.md`](./AGENTS.md) for the complete architecture, constraints, and development roadmap.
@@ -73,7 +74,7 @@ With JDK 8 selected:
 ./gradlew --no-daemon clean test build
 ```
 
-The distributable mod is written to `build/libs/bedwarsbot-0.3.0.jar`. JUnit is
+The distributable mod is written to `build/libs/bedwarsbot-0.4.0.jar`. JUnit is
 used only for deterministic Minecraft-independent state, safety, queue, and
 serialization tests.
 
@@ -228,7 +229,7 @@ foundation and cannot apply inputs or prevent manual release.
 Use a local single-player world and keep control `DISABLED` throughout:
 
 1. Launch with `./gradlew --no-daemon runClient`. Confirm the Mods list reports
-   Bedwars Bot `0.3.0`, then enter a local world.
+   Bedwars Bot `0.4.0`, then enter a local world.
 2. Confirm the HUD still shows `mode=DISABLED`, `proposed=none`, and
    `active=none`. Confirm observed chunk loads increase naturally, the current
    loaded-chunk count is nonzero, and the overlay does not suddenly contain an
@@ -320,6 +321,104 @@ python3 -m unittest discover -s tools/tests -p 'test_*.py'
 python3 tools/audit_observation_log.py \
   tools/tests/fixtures/observation_session.jsonl
 ```
+
+## Phase 2 passive initial chunk snapshots
+
+Each client-side `ChunkEvent.Load` schedules only the exact chunk object supplied
+by that natural Forge callback. The collector never calls a chunk provider,
+looks up neighboring chunks, enumerates all loaded chunks, requests data, or
+changes view distance.
+
+Snapshot work is incremental and globally bounded. The Minecraft client thread
+copies at most 4,096 block states across all snapshot work during an END tick,
+and checks a 1.5 ms deadline before each copied state. Capture can pause within
+a 16×16×16 section and resume on a later tick using a generation, section, and
+within-section cursor. A partial section remains private to the client-thread
+collector and is discarded if its generation unloads; only a completed 4,096-
+state primitive array is published to the worker. Mutable Minecraft objects
+never leave the client thread.
+
+The 1.5 ms deadline is cooperative rather than a hard real-time guarantee: a
+JVM safepoint, garbage collection, or OS descheduling pause can make the measured
+elapsed interval exceed the deadline between clock checks. The measured maximum
+is retained in the HUD and structured log so such outliers remain visible.
+
+The pending scan scheduler is FIFO and bounded to 1,024 chunks. Its entries hold
+only generation/progress bookkeeping and references to chunks already loaded by
+Minecraft; chunk contents are not copied while waiting. Unload, dimension-unload,
+completion, and shutdown paths remove pending references. The separate
+snapshot worker queue is bounded to 512 events. Both use nonblocking insertion;
+the newest work is rejected on overflow and metrics make the resulting partial
+or unsnapshotted coverage explicit. The existing 4,096-event block-observation
+queue and 1,024-record logger queue remain unchanged.
+
+### Coverage and ordering semantics
+
+- A successfully copied null section is full known-air coverage, represented by
+  uniform state ID `0`. It is distinct from a section that has not been copied.
+- Captured sections are `KNOWN` while loaded. Uncaptured positions remain
+  `UNKNOWN`, including positions in a partial snapshot.
+- All 16 sections must reach the worker before a generation can become
+  `COMPLETE`. An abort or malformed completion remains `PARTIAL`.
+- Unload retains captured values as `STALE`. Reload creates a new generation;
+  late sections from an older generation are rejected.
+- Section captures and specific block changes share one client-thread capture
+  sequence. The chunk store retains per-position block overrides, so the newest
+  client-thread observation wins regardless of worker timing.
+- This store is separate from the sparse dynamic block-change overlay. Snapshot
+  initialization does not manufacture overlay changes or alter its behavior.
+
+The snapshot worker writes schema-v1 `chunk_snapshot_scheduled`,
+`chunk_snapshot_section_captured`, `chunk_snapshot_completed`,
+`chunk_snapshot_aborted`, unload, per-active-tick scan metrics, and final
+pipeline-summary records. Dense section state IDs use background-generated
+`u16le_base64_v1`; uniform sections use a single state value. No large
+serialization occurs on the client thread.
+
+The HUD adds pending chunks/sections, lifetime completion/abort/partial counts,
+current complete/partial/stale store counts, covered and scanned sections,
+blocks copied on the latest active tick, scan duration and budget-stop reason,
+maximum scan time, partial-section resumes, and snapshot queue
+depth/drop/failure metrics.
+
+The observation log auditor also validates snapshot generations, exact section
+coverage before completion, unload/reload handling, obsolete-generation
+mutations, scan budgets, final queue health, and the pipeline summary. Its text
+and optional JSON reports include per-generation section indices, final
+partial/complete/stale coverage, scan-stop counts, and snapshot throughput.
+Per-generation terminal details are bounded by default; pass
+`--verbose-snapshots` to print every generation. The optional JSON report always
+contains the complete generation data.
+
+### Initial-snapshot local-client checklist
+
+Use a local single-player world and keep the bot `DISABLED`:
+
+1. Launch `./gradlew --no-daemon runClient`, confirm version `0.4.0`, and enter a
+   fresh local world. Confirm `proposed=none` and `active=none` throughout.
+2. Watch natural chunk loads populate `snap pending`; confirm scanned sections
+   rise by no more than one and scanned blocks by no more than 4,096 per client
+   tick. Pending work should drain without enumerating or reloading the world.
+3. Confirm completed snapshots rise only after 16 sections, queue depth normally
+   returns toward zero, and snapshot drops/failures remain zero.
+4. While a backlog exists, leave the world. Confirm unfinished generations
+   increment aborted/partial counts and captured coverage becomes stale rather
+   than complete.
+5. Re-enter the world. Confirm new natural loads get new generations and new
+   captures replace old generations; old stale data must not become known merely
+   because a callback from the previous world finishes.
+6. Place and break a block while its chunk is being or has been captured. Confirm
+   the existing nearby-change HUD and sparse overlay still update normally.
+   After the queue drains, verify the latest specific block observation is not
+   overwritten by an older section result.
+7. Press F10 during an allowed local movement smoke test and reconfirm immediate
+   `DISABLED` mode and input release; passive snapshot activity must continue
+   without delaying or changing control safety.
+8. Exit cleanly and inspect the newest JSONL session. Confirm ordered lifecycle
+   records, 16 section records before each successful completion, explicit abort
+   reasons for interrupted captures, a `chunk_snapshot_pipeline_summary` with
+   zero queue depth/drops/failures, the existing observation summary, and final
+   `session_end`.
 
 ## Legacy toolchain risks
 

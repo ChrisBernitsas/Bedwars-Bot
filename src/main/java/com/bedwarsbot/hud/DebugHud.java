@@ -3,6 +3,9 @@ package com.bedwarsbot.hud;
 import java.util.concurrent.atomic.AtomicReference;
 
 import com.bedwarsbot.observation.BlockPosition;
+import com.bedwarsbot.observation.ChunkSnapshotHudSnapshot;
+import com.bedwarsbot.observation.ChunkSnapshotPipeline;
+import com.bedwarsbot.observation.ClientObservedChunkStore;
 import com.bedwarsbot.observation.ObservationHudSnapshot;
 import com.bedwarsbot.observation.SparseBlockOverlay;
 import net.minecraft.client.Minecraft;
@@ -17,16 +20,21 @@ public final class DebugHud {
 
     private final AtomicReference<HudSnapshot> snapshotReference;
     private final AtomicReference<ObservationHudSnapshot> observationSnapshotReference;
+    private final AtomicReference<ChunkSnapshotHudSnapshot> chunkSnapshotReference;
 
     public DebugHud(
         AtomicReference<HudSnapshot> snapshotReference,
-        AtomicReference<ObservationHudSnapshot> observationSnapshotReference
+        AtomicReference<ObservationHudSnapshot> observationSnapshotReference,
+        AtomicReference<ChunkSnapshotHudSnapshot> chunkSnapshotReference
     ) {
-        if (snapshotReference == null || observationSnapshotReference == null) {
+        if (snapshotReference == null
+            || observationSnapshotReference == null
+            || chunkSnapshotReference == null) {
             throw new IllegalArgumentException("HUD snapshot references must not be null");
         }
         this.snapshotReference = snapshotReference;
         this.observationSnapshotReference = observationSnapshotReference;
+        this.chunkSnapshotReference = chunkSnapshotReference;
     }
 
     @SubscribeEvent
@@ -134,6 +142,82 @@ public final class DebugHud {
             font.drawStringWithShadow(
                 "observation failures=" + observation.getFailureCount()
                     + " last=" + observation.getFailureMessage(),
+                4,
+                y,
+                WARNING_COLOR
+            );
+        }
+
+        ChunkSnapshotHudSnapshot chunkSnapshot = chunkSnapshotReference.get();
+        if (chunkSnapshot == null) {
+            return;
+        }
+        ClientObservedChunkStore.StoreSnapshot chunkStore = chunkSnapshot.getStoreSnapshot();
+        ChunkSnapshotPipeline.PipelineSnapshot snapshotPipeline =
+            chunkSnapshot.getPipelineSnapshot();
+        y += 10;
+        font.drawStringWithShadow(
+            "snap pending=" + chunkSnapshot.getPendingChunks() + '/'
+                + chunkSnapshot.getPendingCapacity()
+                + " sections=" + chunkSnapshot.getPendingSections()
+                + " completed=" + chunkStore.getCompletedSnapshots()
+                + " aborted=" + chunkStore.getAbortedSnapshots()
+                + " partial=" + chunkStore.getPartialSnapshots(),
+            4,
+            y,
+            TEXT_COLOR
+        );
+        y += 10;
+        font.drawStringWithShadow(
+            "snap store=" + chunkStore.getTrackedChunks()
+                + " complete=" + chunkStore.getCompleteChunks()
+                + " partial=" + chunkStore.getPartialChunks()
+                + " stale=" + chunkStore.getStaleChunks()
+                + " covered sections=" + chunkStore.getCoveredSections(),
+            4,
+            y,
+            TEXT_COLOR
+        );
+        y += 10;
+        font.drawStringWithShadow(
+            "snap scan sections=" + chunkSnapshot.getScannedSections()
+                + " blocks=" + chunkSnapshot.getScannedBlocks()
+                + " tick=" + chunkSnapshot.getLastBlocksCopiedThisTick()
+                + " last/avg/max=" + nanosToMicros(chunkSnapshot.getLastScanNanos())
+                + '/' + nanosToMicros(chunkSnapshot.getAverageScanNanos())
+                + '/' + nanosToMicros(chunkSnapshot.getMaxScanNanos()) + "us"
+                + " stop=" + chunkSnapshot.getLastScanStopReason(),
+            4,
+            y,
+            TEXT_COLOR
+        );
+        y += 10;
+        font.drawStringWithShadow(
+            "snap budget block/time=" + chunkSnapshot.getBlockBudgetStopCount()
+                + '/' + chunkSnapshot.getTimeBudgetStopCount()
+                + " resumes=" + chunkSnapshot.getPartialSectionResumeCount(),
+            4,
+            y,
+            TEXT_COLOR
+        );
+        y += 10;
+        font.drawStringWithShadow(
+            "snap queue=" + snapshotPipeline.getQueueDepth() + '/'
+                + snapshotPipeline.getQueueCapacity()
+                + " dropped=" + snapshotPipeline.getDroppedEvents()
+                + " processed=" + snapshotPipeline.getProcessedEvents()
+                + " failures=" + snapshotPipeline.getFailureCount(),
+            4,
+            y,
+            snapshotPipeline.getDroppedEvents() == 0L
+                && snapshotPipeline.getFailureCount() == 0L
+                ? TEXT_COLOR
+                : WARNING_COLOR
+        );
+        if (snapshotPipeline.getFailureMessage() != null) {
+            y += 10;
+            font.drawStringWithShadow(
+                "snapshot failure=" + snapshotPipeline.getFailureMessage(),
                 4,
                 y,
                 WARNING_COLOR
