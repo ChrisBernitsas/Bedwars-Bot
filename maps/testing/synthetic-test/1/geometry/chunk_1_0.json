@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "geometry_format_version": 1,
+  "dimension": 0,
+  "chunk_x": 1,
+  "chunk_z": 0,
+  "sections": [
+    {
+      "section_index": 0,
+      "coverage": "PARTIAL",
+      "palette": [
+        {
+          "block_id": 0,
+          "metadata": 0
+        },
+        {
+          "block_id": 35,
+          "metadata": 14
+        }
+      ],
+      "coverage_encoding": "bitset_lsb0_base64_v1",
+      "coverage_data": "Aw==",
+      "state_encoding": "u8_palette_indices_base64_v1",
+      "state_data": "AAE="
+    }
+  ]
+}

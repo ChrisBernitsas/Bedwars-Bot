@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "geometry_format_version": 1,
+  "dimension": 0,
+  "chunk_x": 0,
+  "chunk_z": 0,
+  "sections": [
+    {
+      "section_index": 0,
+      "coverage": "COMPLETE",
+      "palette": [
+        {
+          "block_id": 0,
+          "metadata": 0
+        }
+      ],
+      "state_encoding": "uniform_palette_index_v1",
+      "state_data": "0"
+    }
+  ]
+}

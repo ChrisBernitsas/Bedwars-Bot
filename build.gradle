@@ -47,3 +47,12 @@ processResources {
         exclude 'mcmod.info'
     }
 }
+
+task validateCanonicalMap(type: JavaExec, dependsOn: classes) {
+    main = 'com.bedwarsbot.world.canonical.CanonicalMapValidatorMain'
+    classpath = sourceSets.main.output
+    def mapPath = project.hasProperty('canonicalMapPath')
+        ? project.property('canonicalMapPath')
+        : 'maps/testing/synthetic-test/1'
+    args file(mapPath).absolutePath
+}

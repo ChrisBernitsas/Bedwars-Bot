@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "landmark_format_version": 1,
+  "landmarks": [
+    {
+      "landmark_id": "bed-alpha",
+      "type": "BED",
+      "position": {
+        "x": 4,
+        "y": 1,
+        "z": 4
+      },
+      "facing": "EAST",
+      "team": "alpha",
+      "display_name": "Synthetic Alpha Bed",
+      "confidence": 1.0,
+      "provenance": "synthetic test fixture",
+      "validation_status": "UNVERIFIED",
+      "notes": null
+    },
+    {
+      "landmark_id": "diamond-center",
+      "type": "DIAMOND_GENERATOR",
+      "position": {
+        "x": 15,
+        "y": 1,
+        "z": 8
+      },
+      "facing": null,
+      "team": null,
+      "display_name": "Synthetic Diamond Generator",
+      "confidence": 0.75,
+      "provenance": "synthetic test fixture",
+      "validation_status": "UNVERIFIED",
+      "notes": "Intentionally team-neutral."
+    },
+    {
+      "landmark_id": "shop-alpha",
+      "type": "ITEM_SHOP",
+      "position": {
+        "x": 3,
+        "y": 1,
+        "z": 6
+      },
+      "facing": "SOUTH",
+      "team": "alpha",
+      "display_name": "Synthetic Item Shop",
+      "confidence": 0.5,
+      "provenance": "synthetic test fixture",
+      "validation_status": "UNVERIFIED",
+      "notes": null
+    },
+    {
+      "landmark_id": "spawn-alpha",
+      "type": "TEAM_SPAWN",
+      "position": {
+        "x": 2,
+        "y": 1,
+        "z": 2
+      },
+      "facing": "EAST",
+      "team": "alpha",
+      "display_name": "Synthetic Alpha Spawn",
+      "confidence": 1.0,
+      "provenance": "synthetic test fixture",
+      "validation_status": "UNVERIFIED",
+      "notes": null
+    }
+  ]
+}

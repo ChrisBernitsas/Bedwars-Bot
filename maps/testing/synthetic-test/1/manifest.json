@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "map_id": "synthetic-test",
+  "display_name": "Synthetic Test Map",
+  "map_revision": "1",
+  "bedwars_mode": "testing-only",
+  "minecraft_version": "1.8.9",
+  "dimension": 0,
+  "bounds": {
+    "min_x": 0,
+    "min_y": 0,
+    "min_z": 0,
+    "max_x": 31,
+    "max_y": 31,
+    "max_z": 15
+  },
+  "source_provenance": "synthetic unit-test fixture; not copied from any server map",
+  "acquisition_date": null,
+  "source_reference": null,
+  "source_checksum": null,
+  "validation_status": "UNVERIFIED",
+  "notes": "Testing-only geometry with no real Hypixel coordinates.",
+  "geometry_format": "palette-section-json",
+  "geometry_format_version": 1,
+  "landmark_format": "landmarks-json",
+  "landmark_format_version": 1,
+  "landmarks_file": "landmarks.json",
+  "geometry_files": [
+    "geometry/chunk_0_0.json",
+    "geometry/chunk_1_0.json"
+  ],
+  "geometry_sha256": "f2fd6be7f3acfda9ce115f820e3dfd7178b890aef00b52310aab4131acb0d9c8"
+}

@@ -420,6 +420,89 @@ Use a local single-player world and keep the bot `DISABLED`:
    zero queue depth/drops/failures, the existing observation summary, and final
    `session_end`.
 
+## Phase 2C canonical map foundation
+
+The canonical map package describes normal static map geometry and semantic
+landmarks without depending on Forge or Minecraft runtime classes. It is an
+offline data foundation only: it is not yet connected to map detection, passive
+block observations, or naturally loaded chunk snapshots.
+
+Canonical maps live under `maps/<map-id>/<revision>/`. Each directory contains:
+
+```text
+manifest.json
+landmarks.json
+geometry/chunk_<x>_<z>.json
+```
+
+The schema is versioned at the map, geometry, and landmark levels. The manifest
+records map identity and revision, Bedwars mode/family, Minecraft version,
+dimension, inclusive geometry bounds, provenance, nullable acquisition/source
+fields, explicit validation status, and an expected geometry SHA-256.
+
+Geometry is organized by chunk and 16×16×16 section. Each section normalizes its
+palette into deterministic `(block_id, metadata)` order and has explicit coverage:
+
+- `UNKNOWN` contains no known positions.
+- `PARTIAL` contains between 1 and 4,095 specifically known positions.
+- `COMPLETE` contains all 4,096 positions.
+
+A known position containing state `(0,0)` is known air. An unknown position has
+no palette index. These states are distinct in both the APIs and serialized
+coverage data. Chunk or section presence never implies complete knowledge.
+Complete uniform sections use one palette index; other complete sections use
+packed palette indices. Partial sections use a compact Base64 bitset plus
+packed indices only for covered positions.
+
+Landmarks are stored separately from blocks. The model supports team spawns,
+beds, forges, item and upgrade shops, team and Ender Chests, diamond and emerald
+generators, and general navigation landmarks. Team and facing are nullable;
+confidence, provenance, and validation status remain explicit.
+
+Loading is strict. Unsupported versions, malformed or truncated JSON/Base64,
+unsafe referenced paths, invalid coverage/palettes/states, duplicate identities,
+out-of-bounds data, and hash mismatches are rejected with structured validation
+issues. Filesystem enumeration is never used to discover geometry; the sorted
+manifest list is authoritative. Schema-v1 input is bounded to 4 MiB per JSON
+file, 64 MiB per map, 4,096 chunk files, 16 sections per chunk, 4,096 palette
+entries per section, and 16,384 landmarks. JSON parsing also has explicit nesting,
+container, and value-count limits. Referenced paths must be normalized, remain
+inside the map directory, and contain no symbolic-link components.
+
+The geometry SHA-256 includes the schema-v1 hash domain, dimension, declared
+bounds, and every covered position's sorted chunk/section/index and decoded
+block ID/metadata. It excludes map/display metadata, provenance, acquisition
+fields, landmarks, source checksum, palette ordering, filenames, and filesystem
+order. Consequently, equivalent geometry has the same hash while known air and
+unknown coverage hash differently. A supplied source checksum is stored and
+validated independently.
+
+Validate the checked-in synthetic fixture using the runtime-independent Java
+entry point through the convenience task:
+
+```sh
+./gradlew --no-daemon validateCanonicalMap
+```
+
+Validate another directory with:
+
+```sh
+./gradlew --no-daemon validateCanonicalMap \
+  -PcanonicalMapPath=/absolute/path/to/maps/<map-id>/<revision>
+```
+
+After compilation, the validator can also run with only project classes on its
+classpath—no Minecraft or Forge runtime is loaded:
+
+```sh
+java -cp build/classes/main \
+  com.bedwarsbot.world.canonical.CanonicalMapValidatorMain \
+  maps/testing/synthetic-test/1
+```
+
+The fixture is deliberately tiny and labeled testing-only. It contains no real
+Hypixel or Speedway geometry. No production canonical maps are included yet.
+
 ## Legacy toolchain risks
 
 This stack is intentionally old. Artifact repositories or TLS behavior can
